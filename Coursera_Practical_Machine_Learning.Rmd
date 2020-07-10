@@ -1,0 +1,223 @@
+---
+title: "Coursera's Practical Machine Learning"
+author: "Jan Taubenheim"
+date: "6/10/2020"
+output: html_document
+---
+
+```{r setup, message=FALSE, warning =FALSE}
+require(caret)
+require(caretEnsemble)
+require(data.table)
+require(ggplot2)
+require(skimr)
+set.seed(1006)
+```
+# Synopsis
+There is a current trend of many people to self optimize in several ways including the measurement and analysis of their movement during and outside sport activities. To date, activities which are recorded are of quantitative values (how often/long) but contain less qualitative information (how well). The here used data set tries to assess the quality of a movement by analysising the 
+
+# Data
+The measurments were taken with four 9 degrees of freedom razor inertial measurement units, which were placed at the wrist, forearm, the hip, and a dumbell to measure movement during biceps curls. In total six participants were asked to perform 10 repetitions each of five different executions of the excercise (one of these correct, the others with flaws in execution). The data was processed in a way, that Euler angles (yaw, roll, pitch) for time windows of 2.5 s with 0.5 s overlap were calculated. For each of the time windows, mean, variance, standard deviation, max, min, amplitude, kurtosis and skewness were calculated.
+
+The data for the project was already split into a training and a prediction set. I will split/cross validate only on the training data set to finally predict the outcome of the best model on the "test" set.
+
+# Analysis
+Since many preprocessing steps have been performed which introduce many NAs (and require some kind of handling) I will use only the raw data set and try to find a good fitting model on it.
+```{r dataLoad, message=FALSE}
+# fetch the data and partition in a training set and a test set
+#wl<- fread("weightlift.csv", drop = 1:2, stringsAsFactors = TRUE)                 
+wl <- fread("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv", drop=1)
+```
+
+```{r describeDF, message=F, warning =F, error =F, out.width="50%", fig.show= "hold"}
+dplyr::sample_n(as.data.frame(wl), 5)
+# there are a lot of NA in the sample, lets quantify that column and row wise
+hist(apply(wl,2, function(x) sum(is.na(x))/length(x)), 
+     main = "Fraction of NAs per column",
+     xlab = "Fraction NAs",
+     breaks = 100)
+hist(apply(wl,1, function(x) sum(is.na(x))/length(x)), 
+     main = "Fraction of NAs per rows",
+     xlab = "Fraction NAs",
+     breaks = 50)
+```
+
+As said above, I will discard a lot of the data in the set, simply because it is easier to handle. If I had enough time and it would be something really important I would use different approaches to analyze the data which would demand much data transformation (see discussion at the end of the document). Still, I probably discard more data than necessary, I could for example build different models for the data with the extra statistics calculated and the raw data only. However, since this is only a tutorial and the prediction set contains only 20 points without data on curtosis etc. I guess it is best to stick to the raw data, available to all data points.
+
+
+```{r prepProc, message=F, warning =F, error =F}
+# preprocessing, removing columns with mostly NA
+sel <- !apply(wl,2,function(x) any(is.na(x)))
+wl_raw<- data.table(as.data.frame(wl)[,sel]) # our raw data set for each single timepoint
+```
+
+Since we have the cleaned data sets now, we can start to partition it into training and test sets. 
+The raw data is large enough to simply split to 0.7 and 0.3 training and test sets.
+
+```{r dataSplittingRaw}
+trainIndex <- createDataPartition(wl_raw$classe, p= 0.7, list=FALSE, times=1)
+# exclude the user and the window variables, as we do not want the method to be
+# user specific nor dependent on the window variables
+# also remve cvt_timestamp, as it is a abbrev. of the first two time stamps
+train <- wl_raw[trainIndex,-c(1,4,5,6)]
+test <- wl_raw[-trainIndex,]
+```
+
+Lets see if the variables are highly skewed, zero variant or something similar. If needed I will do some basic pre-processing to it.
+
+```{r preProc2}
+nzv <- nearZeroVar(train, saveMetrics = TRUE)
+table(nzv$nzv) 
+# no zero variance data detected
+cls <- ncol(train)
+corDat <- cor(train[,-..cls]) # remove classe variable from correlation
+cvar <- findCorrelation(corDat, cutoff = 0.85)
+colnames(train)[cvar]
+# there are some highly correlated varibles, which I will remove from the training data
+train <- train[,-..cvar]
+
+# most of the variables look quite nicely distributed, however, some centering won't harm, i guess
+ppro <- preProcess(train, method = c("center","scale"))
+skim(predict(ppro, train))
+
+```
+
+I will fit several models and evaluate which one is best in the end. Since the data set is fairly large and I have only a laptop to work on, I will fit models which are less computational intense.
+
+```{r modelsRawP1, eval = FALSE, echo = TRUE}
+trctrl <- trainControl(allowParallel = TRUE,
+                       preProcOptions = c("center","scale"),
+                       method = "repeatedcv",
+                       number = 10,
+                       index = createFolds(train$classe, 10),
+                       repeats = 3,
+                       savePredictions = TRUE,
+                       classProbs = TRUE)
+modelList <- c("rpart","LogitBoost","naive_bayes","knn")
+models <- caretList(classe~.,
+                    data =train,
+                    trControl = trctrl,
+                    methodList = modelList)
+# save the models into an RDS file
+saveRDS(models, file ="models.RDS")
+```
+```{r loadModels, echo = FALSE}
+modelList <- c("rpart","LogitBoost","naive_bayes","knn")
+models <- readRDS("models.RDS")
+```
+
+```{r modelsRawP2}
+rsmpl <- resamples(models)
+summary(rsmpl)
+bwplot(rsmpl)
+```
+
+Of the four models I fitted the LogitBoost seems to be most accurate and has in general most congruency with the data (Kappa), while K-nearest-neighbor performs worst. The data set seems to be very homogenous, as there is not much variation in the estimates for out-of-sample accuracy or Cohen's Kappa.
+
+To increase the accuracy, or being a little more robust maybe, I will try to stack the models. To that end, I test the correlation of the models. Low correlation of result prediction indicates, that the models do their prediction different from each other, thus a stacking might exploit these differences and improves the accuracy as well as robustness.
+
+```{r modelCorrelation}
+modelCor(rsmpl)
+```
+
+The models are very distinct from another (except maybe the rpart and the LogitBoost), thus a stacking might be useful.
+
+```{r modelStackP1, eval = FALSE, echo = TRUE}
+# predict the outcome of the training dataset with the different models, which can be afterwards used to 
+trainEnsemble <- as.data.frame(lapply(X = models, function(x) predict(x,train)))
+trainEnsemble[["classe"]] <- train$classe
+
+stackTrctrl <- trainControl(allowParallel = TRUE,
+                       preProcOptions = c("medianImpute"),
+                       method = "repeatedcv",
+                       number = 10,
+                       index = createFolds(train$classe, 10),
+                       repeats = 3,
+                       savePredictions = TRUE,
+                       classProbs = TRUE)
+# do not use knn for stacking, as the predictions again contain NAs, and knn can not handle these
+stackedModels <- lapply(as.list(modelList[-length(modelList)]), function(x)
+        train(classe~.,
+              data = trainEnsemble,
+              method = x,
+              trControl = stackTrctrl,
+              na.action = na.pass)
+)
+saveRDS(stackedModels, file ="stackedModels.RDS")
+```
+```{r loadModels2, echo = FALSE}
+stackedModels <- readRDS("stackedModels.RDS")
+```
+```{r modelStackP2}
+names(stackedModels) <- modelList[-length(modelList)]
+class(stackedModels) <- "caretList"
+stackedRsmpl <- resamples(stackedModels)
+bwplot(stackedRsmpl)
+```
+
+After stacking the models, the LogitBoost performs best again, with a slightly improved accuracy and Kappa. Lets check how the different models (single and stacked) perform on the test data.
+
+```{r checkTest}
+cnfsn <- lapply(models, 
+            function(x) confusionMatrix(predict(x, test),as.factor(test$classe))$overall[c("Accuracy","Kappa")])
+cnfsn <- t(as.data.frame(cnfsn))
+cnf_name <- data.frame(Model = rownames(cnfsn), Stacked = "no")
+cnfsn <- cbind(cnfsn, cnf_name)
+
+testEnsemble <- as.data.frame(lapply(X = models, function(x) predict(x,test)))
+testEnsemble[["classe"]] <- as.factor(test$classe)
+# remove rows with NA
+testEnsemble <- testEnsemble[rowSums(is.na(testEnsemble))==0,]
+
+stackedCnfsn <- lapply(stackedModels, function(x){
+        confusionMatrix( predict(x,testEnsemble),
+                         testEnsemble$classe)$overall[c("Accuracy","Kappa")]})
+stackedCnfsn <- t(as.data.frame(stackedCnfsn))
+stcnf_name <- data.frame(Model = rownames(stackedCnfsn), Stacked = "yes")
+stackedCnfsn <- cbind(stackedCnfsn, stcnf_name)
+cnfall <- rbind(cnfsn,stackedCnfsn)
+knitr::kable(cnfall)
+p <- ggplot(cnfall, aes(x=Accuracy, y=Kappa, color=Model, shape = Stacked)) + geom_point(size=3)
+p
+```
+
+So in general, the models perform pretty much similar to what the out-of-sample estimate predicted, with the stacked LogitBoost model performing best. What is a little discomforting is the fact that the out-of-sample estimates for most of the models are lower than the actual test sample performance.
+
+```{r outOfSampleVsActual}
+mnEst <- apply(rsmpl$values[,-1],2,mean)
+stMnEst <- apply(stackedRsmpl$values[,-1],2,mean)
+
+mnEst <- data.frame(Accuracy = mnEst[grep("Accuracy",names(mnEst))],
+                    Kappa = mnEst[grep("Kappa",names(mnEst))],
+                    Model = unique(gsub("~.*","",names(mnEst))),
+                    Stacked = "no")
+
+stMnEst <- data.frame(Accuracy = stMnEst[grep("Accuracy",names(stMnEst))],
+                      Kappa = stMnEst[grep("Kappa",names(stMnEst))],
+                      Model = unique(gsub("~.*","",names(stMnEst))),
+                      Stacked = "yes")
+mnEst <- rbind(mnEst,stMnEst)
+compareEst <- rbind(cbind(mnEst, Estimate = "OOS"), cbind(cnfall, Estimate ="WS"))
+rownames(compareEst) <- 1:nrow(compareEst)
+knitr::kable(compareEst)
+diffEst <- cbind(mnEst[,-(1:2)],mnEst[,1:2]-cnfall[,1:2])
+rownames(diffEst) <- 1:nrow(diffEst)
+knitr::kable(diffEst, caption = "Difference of the OOS and WS estimates for Accuracy and Kappa")
+```
+
+I am not quite sure what the reason for this is. It might be that the number of cross-validations is not sufficiently large enough, though the ones calculated are very homogenous. I am at this point not enough of an expert to really know what is going on here. However, I am not too much concerned, as numbers of the estimates are really close to each other and everything looks reasonable.
+
+Finally I will predict the classes for the held out data set in the project itself, with the stacked LogitBoost. 
+
+```{r checkTest2}
+test2 <- fread("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv")
+test2Ensemble <- as.data.frame(lapply(X = models, function(x) predict(x,test2)))
+test2Ensemble[["classe"]] <- test2$classe
+
+test2predict <- predict(stackedModels$LogitBoost, test2Ensemble)
+print(test2predict)
+
+```
+
+# Discussion
+It is rather surprising, that it is possible to predict the quality of biceps curls by simple measurements of accelerometers, if one considers, that it is only point measurements in the movement. If I had conducted the study I would have used a much more complicated approach by fitting curves to time windows over the movement for the different values. Afterwards I would have taken the estimates for the curves to train a model. This would, at least to some extend, consider the time variable in the data, which is currently completely disregarded. However, it seems to work as is.
